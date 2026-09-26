@@ -188,7 +188,9 @@ function userHasRequiredRole(
   return false;
 }
 
-function mapSsoProviderToOAuthConfig(provider: SsoProviderConfig): GenericOAuthConfig {
+export const DEFAULT_OIDC_SCOPES = ["openid", "email", "profile"] as const;
+
+export function mapSsoProviderToOAuthConfig(provider: SsoProviderConfig): GenericOAuthConfig {
   const base = {
     clientId: provider.clientId,
     clientSecret: provider.clientSecret,
@@ -219,6 +221,11 @@ function mapSsoProviderToOAuthConfig(provider: SsoProviderConfig): GenericOAuthC
         providerId: provider.providerId,
         discoveryUrl: provider.discoveryUrl!,
         ...base,
+        // Unlike the keycloak/auth0/okta/entra helpers, the generic branch has no
+        // default scopes. Without them the authorization request carries no
+        // `scope` parameter and strict IdPs (e.g. Google) reject it with
+        // "Missing required parameter: scope". An explicit, non-empty list wins.
+        scopes: provider.scopes?.length ? provider.scopes : [...DEFAULT_OIDC_SCOPES],
       };
       break;
   }
@@ -309,6 +316,29 @@ export function withRoleRestrictedUserInfo(
   return baseConfig;
 }
 
+/**
+ * Better Auth reads account linking from `options.account.accountLinking`
+ * (see `better-auth/dist/oauth2/link-account.mjs`). A top-level
+ * `accountLinking` key is silently ignored.
+ */
+export function buildSsoAccountOptions(providers: SsoProviderConfig[]): Record<string, unknown> {
+  if (providers.length === 0) return {};
+  return {
+    account: {
+      accountLinking: {
+        enabled: true,
+        // Better Auth defaults this to true, i.e. it only links an SSO identity
+        // to a local account whose email is already verified. Paperclip runs
+        // with `requireEmailVerification: false`, so no local account is ever
+        // verified and linking would always be refused. Proof of the address
+        // moves to the IdP, and only for the configured trustedProviders.
+        requireLocalEmailVerified: false,
+        trustedProviders: providers.map((p) => p.providerId),
+      },
+    },
+  };
+}
+
 export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins: string[]): BetterAuthInstance {
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const publicUrl = process.env.PAPERCLIP_PUBLIC_URL?.trim() || baseUrl;
@@ -349,14 +379,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       disableSignUp: config.authDisableSignUp,
     },
     ...(plugins.length > 0 ? { plugins } : {}),
-    ...(oauthConfigs.length > 0
-      ? {
-          accountLinking: {
-            enabled: true,
-            trustedProviders: config.ssoProviders.map((p) => p.providerId),
-          },
-        }
-      : {}),
+    ...buildSsoAccountOptions(config.ssoProviders),
     rateLimit: buildBetterAuthRateLimitOptions({
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
