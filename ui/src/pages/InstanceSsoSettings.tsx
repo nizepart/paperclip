@@ -444,7 +444,7 @@ export function InstanceSsoSettings() {
             <p className="max-w-2xl text-sm text-muted-foreground">
               When enabled, configured SSO providers override the{" "}
               <code className="text-xs">PAPERCLIP_SSO_PROVIDERS</code> environment variable.
-              Users who log in via SSO are automatically provisioned into all existing companies.
+              SSO users start with no company memberships and join through invites or join requests.
             </p>
           </div>
           <ToggleSwitch
@@ -508,8 +508,8 @@ export function InstanceSsoSettings() {
             Changes take effect immediately — the auth handler is rebuilt on save without a server restart.
           </li>
           <li>
-            SSO users who pass the role check are automatically added to all
-            existing companies on first login.
+            SSO users who pass the role check start with no company memberships. They join
+            companies through the regular invite and join-request flows.
           </li>
           <li>
             The <code>PAPERCLIP_SSO_PROVIDERS</code> environment variable still works as a
