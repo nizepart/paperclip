@@ -33,7 +33,7 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp(actor: any) {
+async function createApp(actor: any, options?: Parameters<typeof import("../routes/instance-settings.js").instanceSettingsRoutes>[1]) {
   const [{ errorHandler }, { instanceSettingsRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
     vi.importActual<typeof import("../routes/instance-settings.js")>("../routes/instance-settings.js"),
@@ -44,12 +44,30 @@ async function createApp(actor: any) {
     req.actor = actor;
     next();
   });
-  app.use("/api", instanceSettingsRoutes({} as any));
+  app.use("/api", instanceSettingsRoutes({} as any, options));
   app.use(errorHandler);
   return app;
 }
 
 describe("instance settings routes", () => {
+  it("does not disclose SSO client secrets through the ordinary member settings response", async () => {
+    const app = await createApp({ type: "board", source: "session", userId: "member", companyIds: ["company-1"], isInstanceAdmin: false });
+    const settings = { ...(await mockInstanceSettingsService.get()), sso: { enabled: true, providers: [{ providerId: "keycloak", type: "keycloak", clientId: "synthetic-client", clientSecret: "synthetic-secret-disclosure-sentinel", issuer: "https://identity.example.test/realms/test" }] } };
+    mockInstanceSettingsService.get.mockResolvedValue(settings);
+    const response = await request(app).get("/api/instance/settings");
+    expect(response.status).toBe(200);
+    expect(JSON.stringify(response.body)).not.toContain("synthetic-secret-disclosure-sentinel");
+    expect(settings.sso.providers[0].clientSecret).toBe("synthetic-secret-disclosure-sentinel");
+  });
+
+  it("does not return SSO secrets from an unrelated settings update", async () => {
+    const app = await createApp({ type: "board", source: "session", userId: "admin", companyIds: ["company-1"], isInstanceAdmin: true });
+    mockInstanceSettingsService.update.mockResolvedValue({ id: "settings", sso: { enabled: true, providers: [{ providerId: "keycloak", clientSecret: "synthetic-secret-update-sentinel" }] } });
+    const response = await request(app).patch("/api/instance/settings").send({ defaultEnvironmentId: null });
+    expect(response.status).toBe(200);
+    expect(JSON.stringify(response.body)).not.toContain("synthetic-secret-update-sentinel");
+  });
+
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../services/index.js");
@@ -821,5 +839,18 @@ describe("instance settings routes", () => {
       expect(res.status).toBe(200);
       expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ executionMode: "kubernetes" });
     });
+  });
+
+  it("validates the merged policy before saving or rebuilding", async () => {
+    const validateSsoSettings = vi.fn(() => { throw new Error("An explicit origin is required."); });
+    const onSsoSettingsChanged = vi.fn();
+    const app = await createApp({ type: "board", userId: "admin", source: "session", isInstanceAdmin: true }, { validateSsoSettings, onSsoSettingsChanged });
+    mockInstanceSettingsService.getSso.mockResolvedValue({ source: "database", enabled: false, providers: [] });
+    mockInstanceSettingsService.updateSso.mockClear();
+    const result = await request(app).patch("/api/instance/settings/sso").send({ enabled: true });
+    expect(result.status).toBe(400);
+    expect(validateSsoSettings).toHaveBeenCalledWith({ source: "database", enabled: true, providers: [] });
+    expect(mockInstanceSettingsService.updateSso).not.toHaveBeenCalled();
+    expect(onSsoSettingsChanged).not.toHaveBeenCalled();
   });
 });

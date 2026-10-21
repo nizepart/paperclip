@@ -12,7 +12,7 @@ import {
   DEPLOYMENT_MODES,
   SECRET_PROVIDERS,
   STORAGE_PROVIDERS,
-  ssoProviderConfigSchema,
+  ssoProvidersSchema,
   type BindMode,
   type AuthBaseUrlMode,
   type DeploymentExposure,
@@ -218,22 +218,13 @@ export function loadConfig(): Config {
       : (fileConfig?.auth?.disableSignUp ?? false);
 
   const ssoProviders: SsoProviderConfig[] = (() => {
-    const envRaw = process.env.PAPERCLIP_SSO_PROVIDERS?.trim();
-    if (envRaw) {
-      try {
-        const parsed = JSON.parse(envRaw);
-        const arr = Array.isArray(parsed) ? parsed : [];
-        const results: SsoProviderConfig[] = [];
-        for (const entry of arr) {
-          const r = ssoProviderConfigSchema.safeParse(entry);
-          if (r.success) results.push(r.data);
-        }
-        return results;
-      } catch {
-        return [];
-      }
-    }
-    return fileConfig?.auth?.ssoProviders ?? [];
+    const envRaw = process.env.PAPERCLIP_SSO_PROVIDERS;
+    let raw: unknown;
+    try { raw = envRaw === undefined ? fileConfig?.auth?.ssoProviders ?? [] : JSON.parse(envRaw); }
+    catch { throw new Error("Invalid operator SSO configuration JSON."); }
+    const parsed = ssoProvidersSchema.safeParse(raw);
+    if (!parsed.success) throw new Error("Invalid operator SSO provider configuration.");
+    return parsed.data;
   })();
 
   const allowedHostnamesFromEnvRaw = process.env.PAPERCLIP_ALLOWED_HOSTNAMES;

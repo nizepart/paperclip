@@ -1,333 +1,174 @@
-# SSO / OIDC Configuration
+# Native SSO / OIDC
 
-Paperclip supports Single Sign-On (SSO) via any OAuth 2.0 / OpenID Connect identity provider.
-SSO is only active when `deploymentMode` is `authenticated`.
+Paperclip supports multiple OIDC providers through its instance settings UI/API
+or operator configuration, using Better Auth 1.7.2. Email/password authentication
+remains available. SSO establishes identity; company invitations and instance
+roles control access.
 
-Related documents:
+## Configuration source
 
-- Implementation plan: [`doc/plans/2026-04-07-sso-oidc-support.md`](plans/2026-04-07-sso-oidc-support.md)
-- Deployment modes: [`doc/DEPLOYMENT-MODES.md`](DEPLOYMENT-MODES.md)
-- Humans and permissions: [`doc/plans/2026-02-21-humans-and-permissions.md`](plans/2026-02-21-humans-and-permissions.md)
-
-## Quick Start
-
-SSO is configured entirely through the Paperclip web UI:
-
-1. Sign in as an instance admin
-2. Navigate to **Instance Settings → SSO**
-3. Toggle **Enable SSO** on
-4. Add one or more SSO providers with their connection details
-5. Click **Save SSO Settings**
-
-Changes take effect immediately — no server restart required. The Better Auth OAuth
-handler is rebuilt on the fly when SSO settings are saved.
-
-## Provider Configuration
-
-### Common Fields
-
-| Field          | Required | Description                                          |
-|----------------|----------|------------------------------------------------------|
-| `providerId`   | Yes      | Unique identifier for this provider                  |
-| `type`         | Yes      | One of: `keycloak`, `auth0`, `okta`, `microsoft_entra_id`, `oidc` |
-| `clientId`     | Yes      | OAuth client ID registered with the IdP              |
-| `clientSecret` | Yes      | OAuth client secret                                  |
-| `displayName`  | No       | Label shown on the login button (defaults to type)   |
-| `scopes`       | No       | Override default OAuth scopes                        |
-
-### Keycloak
-
-| Field    | Required | Example                                                |
-|----------|----------|--------------------------------------------------------|
-| `issuer` | Yes      | `https://keycloak.example.com/realms/your-realm`       |
-
-### Auth0
-
-| Field    | Required | Example                    |
-|----------|----------|----------------------------|
-| `domain` | Yes*     | `your-tenant.auth0.com`    |
-| `issuer` | Yes*     | `https://your-tenant.auth0.com` |
-
-*Either `domain` or `issuer` is required.
-
-### Okta
-
-| Field    | Required | Example                        |
-|----------|----------|--------------------------------|
-| `issuer` | Yes      | `https://your-org.okta.com`    |
-
-### Microsoft Entra ID (Azure AD)
-
-| Field      | Required | Example            |
-|------------|----------|--------------------|
-| `tenantId` | Yes      | `your-tenant-id`   |
-
-### Generic OIDC
-
-Any provider that publishes `/.well-known/openid-configuration`:
-
-| Field          | Required | Example                                                        |
-|----------------|----------|----------------------------------------------------------------|
-| `discoveryUrl` | Yes      | `https://idp.example.com/.well-known/openid-configuration`     |
-
-## Callback URL
-
-Register this callback URL in your identity provider:
+Use authenticated mode and an explicit public origin in `auth.publicBaseUrl`
+(`auth.baseUrlMode: "explicit"`). HTTPS is required outside loopback development.
+Register an exact callback for each stable provider ID:
 
 ```
-{PAPERCLIP_PUBLIC_URL}/api/auth/oauth2/callback/{providerId}
+https://paperclip.example.test/api/auth/callback/keycloak
 ```
 
-For example, if `PAPERCLIP_PUBLIC_URL=https://paperclip.example.com` and `providerId=keycloak`:
+Instance Settings → SSO selects one source:
 
+- **Operator configuration:** `PAPERCLIP_SSO_PROVIDERS` JSON takes precedence over
+  `auth.ssoProviders` in the config file. An explicit empty JSON array means no
+  providers. Malformed environment JSON/provider entries fail startup instead of
+  silently falling back. Mounting the ordinary config file works for cluster
+  secrets; do not commit real client secrets to Git.
+- **Instance settings:** the stored `enabled` flag and provider list are
+  authoritative. Disabled or empty stays disabled across save and restart.
+  Selecting Operator configuration explicitly returns to the environment/file.
+
+For existing #3040 settings without a source field, enabled/nonempty database
+settings remain authoritative; other legacy settings retain its documented
+operator fallback. Malformed stored SSO settings disable SSO instead of
+activating fallback. Saving in the new UI records the source explicitly.
+Startup and live saves use the same resolver. Login buttons reflect providers
+registered by the active auth manager after discovery, not a stale startup list.
+A failed or stalled provider discovery is bounded and leaves local login usable.
+Activating SSO without a valid explicit public origin is rejected before saving.
+If an existing stored configuration is invalid, SSO stays unavailable and local
+password login remains available for recovery.
+Environment/file changes require a restart; database settings rebuild the handler.
+
+## Provider configuration
+
+Up to eight unique providers are supported. IDs use lowercase letters, numbers
+and hyphens, start with a letter, and cannot be `credential`. Presets are
+Keycloak, Auth0, Okta, Microsoft Entra ID and generic OIDC. A renamed preset uses
+its configured ID in both login buttons and callbacks. Keep IDs/issuers/client
+registrations stable after accounts have been linked.
+
+Example operator configuration (synthetic values only):
+
+```json
+[
+  {
+    "providerId": "keycloak",
+    "type": "keycloak",
+    "issuer": "https://identity.example.test/realms/businesses",
+    "clientId": "paperclip",
+    "clientSecret": "REPLACE_USING_SECRET_CONFIGURATION",
+    "displayName": "Company sign-in",
+    "tokenEndpointAuth": "client_secret_post",
+    "requiredRoles": { "claimPath": "realm_access.roles", "roles": ["paperclip-user"] }
+  }
+]
 ```
-https://paperclip.example.com/api/auth/oauth2/callback/keycloak
-```
 
-## Multiple Providers
+Keycloak/Okta use `issuer`; Auth0 uses `domain` or `issuer`; Entra requires a
+concrete tenant GUID. Generic OIDC uses `discoveryUrl`; also supply `issuer` when
+that location does not end in the standard `/.well-known/openid-configuration`.
+Discovery must return the preset's canonical issuer (or the exact configured
+generic OIDC issuer), code flow, usable asymmetric
+signing algorithms and JWKS. Endpoints must use HTTPS, except loopback fixtures.
+`tokenEndpointAuth` supports client_secret_post (default) and client_secret_basic.
+Optional scopes are owned by the operator; openid is always included. Browsers
+cannot add scopes, resource/audience/prompt or other authorization parameters.
 
-You can configure multiple SSO providers in the UI. Each appears as a separate button on the login page.
+Configure the IdP to emit `sub`, email, literal boolean `email_verified: true`,
+issued-at and expiry in the ID token. Optional role admission reads only the
+verified ID token, not an unverified access-token payload. Keycloak's role
+mapper must include the chosen roles in ID tokens. Role admission grants no
+Paperclip company membership or administrator role. The regular invitation and
+join-request paths control company access.
 
-## Role-Based Access Restriction
+## Existing users and recovery
 
-You can restrict SSO login to users who have specific roles in their identity provider. When `requiredRoles` is configured, Paperclip inspects the token claims during the OAuth callback and rejects users who lack a matching role.
+Create and preserve a local administrator password before enabling/closing SSO
+signup. Existing users sign in locally, open Profile, confirm the current local
+password, then authenticate with an IdP identity using the same verified email.
+Email equality alone never links accounts. Confirmation is bound to the same
+live session and expires after five minutes. Changing/revoking that session or
+replaying the callback cannot complete linking. Linking password attempts use
+Better Auth's three-attempt/ten-second IP/path limit; this is not an account-wide
+lockout and respects the existing explicit rate-limit disable override.
 
-### Configuration
+Closed signup also applies to SSO. An invitation does not bypass the instance's
+signup policy. Local password login remains usable after linking and during IdP
+outage. SSO-only users do not automatically acquire a local password.
 
-Add `requiredRoles` to any SSO provider config in the UI:
+Sessions are ordinary Paperclip sessions. Logout revokes the local session and
+requires the configured origin. This does not add IdP single logout, SCIM,
+back-channel logout or immediate offboarding. Disabling a provider/changing a
+role affects subsequent authentication; existing sessions need explicit local
+revocation. Provider token retrieval, refresh and account-info APIs are blocked,
+including old rows after a provider is disabled. Provider tokens still reside in
+the account table: protect database access and backups.
 
-| Field | Required | Description |
-|---|---|---|
-| `claimPath` | Yes | Dot-separated path into the JWT payload to locate the roles claim |
-| `roles` | Yes | Array of role values; user must have **at least one** to be allowed in |
+## Storage, identity and rollback
 
-### How it works
+The SSO settings column is additive JSONB. In database mode, client secrets remain
+in that JSONB and are editable only through the instance-admin SSO API. General
+settings responses omit the secrets even for admins; ordinary members cannot use
+the dedicated SSO endpoint. Audit details record provider count and changed keys,
+not secret values. Application-level encryption of this JSONB is not added here.
+Operator mode avoids copying operator secrets into database settings on startup.
 
-1. After the IdP returns tokens, Paperclip decodes the JWT payload (without cryptographic verification — the IdP already validated the token during the OAuth exchange).
-2. It first checks the `id_token`. If the roles are not found there, it falls back to checking the `access_token`. This fallback is important because some IdPs (notably Keycloak) include client roles only in the access token by default.
-3. It resolves the claim at `claimPath` using dot notation (e.g. `resource_access.paperclip.roles` navigates to `token.resource_access.paperclip.roles`).
-4. If the resolved value is an array, it checks whether any element matches one of the configured `roles`.
-5. If the resolved value is a string, it checks for an exact match.
-6. If no match is found in either token, the login is rejected and a warning is logged.
+Preserve the database, uploads/storage, local encrypted-secret master keys,
+Better Auth session secret and operator/IdP configuration together. A database
+backup alone does not cover file storage or encryption keys. Do not drop auth
+rows, change user IDs, relabel issuers or regenerate keys as a rollback shortcut.
 
-### Provider-specific claim paths
+Better Auth account identity is `(issuer, subject)`; company permissions remain
+attached to the same Paperclip user. Migration `0213_soft_silvermane.sql` adds
+the issuer column and unique key. It backfills passwords as `local:credential`
+and old social accounts as `local:oauth:<providerId>`. Provider ID alone does not
+prove the old issuer, so migration never relabels external identities or links
+by email. Renaming a provider or repointing its issuer is not an identity migration.
 
-| Provider | Claim path | Notes |
-|---|---|---|
-| Keycloak | `resource_access.<clientId>.roles` | Client roles |
-| Keycloak | `realm_access.roles` | Realm roles |
-| Auth0 | `https://your-namespace/roles` | Custom claims via Auth0 Rules/Actions |
-| Okta | `groups` | Group membership (add `groups` to scopes) |
-| Azure AD | `roles` | App roles |
-| Generic OIDC | Varies by provider | Check your IdP's token documentation |
+### Upgrade preflight
 
-### Disabling role restriction
-
-Omit `requiredRoles` from the provider config. When not set, all authenticated SSO users are allowed in.
-
-## Account Linking
-
-When SSO is enabled, account linking is automatically activated. If a user signs in via SSO with an email that matches an existing email/password account, the SSO identity is linked to the existing user. The user can then sign in with either method.
-
-## Login Page Behavior
-
-- **SSO disabled** (default): Standard email/password sign-in and sign-up page.
-- **SSO enabled**: SSO provider buttons appear on the sign-in page. Email/password sign-in remains available. The sign-up option is hidden (new users are provisioned via SSO).
-- In `local_trusted` mode, SSO is ignored (no login required).
-- SSO users receive the same `board` actor type and permissions as email/password users.
-- Company memberships and permissions are identity-method-agnostic. A first-time SSO user starts without company memberships and joins companies through the regular invite and join-request flows.
-
-## Local Dev with Keycloak (Docker Compose)
-
-A Docker Compose stack is provided for testing SSO locally with Keycloak.
-
-### Prerequisites
-
-- Docker and Docker Compose
-- The repo checked out and built (`pnpm install && pnpm build`)
-- `jq` (used by `scripts/bootstrap-sso-dev.sh`)
-
-### Configure environment variables
-
-The `server` container requires `BETTER_AUTH_SECRET` to be set — the compose
-file fails fast with an error if it's missing. Copy the example env file into
-`docker/.env` and generate a real secret:
+Before applying this version, run the read-only inventory against an isolated
+restore of the old database, using that restore's connection configuration:
 
 ```sh
-cp docker/sso/.env.sso.example docker/.env
+PGOPTIONS='-c default_transaction_read_only=on' \
+  psql "$DATABASE_URL" -X --set ON_ERROR_STOP=on --file scripts/sso-upgrade-preflight.sql
 ```
 
-Then edit `docker/.env` and fill in the empty `BETTER_AUTH_SECRET` with a
-generated value (the example file ships with no value, not a placeholder one):
+The inventory works before and after the issuer migration. It lists social
+account owners, local-password presence, instance/company privileges and
+duplicate legacy account keys. It does not print hashes, tokens or secrets.
+Resolve duplicate keys before migration; do not delete or merge account owners
+just to satisfy the new unique index.
 
-```sh
-sed -i.bak "s#^BETTER_AUTH_SECRET=.*#BETTER_AUTH_SECRET=$(openssl rand -hex 32)#" docker/.env && rm docker/.env.bak
-```
+For each listed user, verify the old issuer, subject and ownership with the user
+and the trusted IdP administrator. Prove an independent local administrator can
+sign in before upgrade. Users with a working local password can sign in locally
+after migration and explicitly link the verified provider in Profile, preserving
+their user ID and grants. Test that path on the restore first.
 
-### Start the stack
+**Stop the upgrade for privileged SSO-only users without a verified recovery
+plan.** An old session or matching email is not a recovery credential. This
+version provides no general password-reset delivery or automatic issuer-mapping
+tool. Arrange a separately reviewed, identity-verified recovery or issuer mapping
+that preserves the existing user and grants; do not create a replacement user,
+silently relabel rows or open signup as a workaround. An ordinary SSO-only user's
+access also needs this review. Preserve the old application and backup until
+every affected owner can authenticate on the isolated restore.
 
-```sh
-docker compose -f docker/docker-compose.sso.yml up --build -d
-```
+For an application rollback, retain the additive SSO column/configuration and
+all auth rows, files and keys. An older application may ignore the extra column;
+it must not be assumed compatible with newer account semantics. Restore a full
+compatible backup into an isolated target when schema/auth versions require it.
+Validate both restored data and local recovery before any real rollout.
 
-This starts three services:
+## Local Keycloak acceptance
 
-| Service    | URL                          | Purpose                                |
-|------------|------------------------------|----------------------------------------|
-| `db`       | `localhost:5432`             | Postgres 17 database                   |
-| `keycloak` | `http://localhost:8080`      | Keycloak 26.2 identity provider        |
-| `server`   | `http://localhost:3100`      | Paperclip in authenticated mode        |
-
-### Bootstrap the instance
-
-Run the bootstrap script to create an admin user and activate the instance:
-
-```sh
-./scripts/bootstrap-sso-dev.sh
-```
-
-The script:
-
-1. Waits for Paperclip to become healthy
-2. Creates an admin user (`admin@paperclip.dev` / `paperclip-admin-123` by default)
-3. Generates a bootstrap CEO invite via the CLI
-4. Accepts the invite to promote the user to instance admin
-
-Override defaults with environment variables:
-
-```sh
-ADMIN_EMAIL=me@example.com ADMIN_PASSWORD=secret123 ./scripts/bootstrap-sso-dev.sh
-```
-
-### Configure SSO via the UI
-
-After bootstrapping, SSO is **not** enabled by default. To set up the Keycloak SSO provider:
-
-1. Sign in at `http://localhost:3100` with `admin@paperclip.dev` / `paperclip-admin-123`
-2. Go to **Instance Settings → SSO**
-3. Toggle **Enable SSO** on
-4. Add a provider with these settings:
-
-| Field | Value |
-|---|---|
-| Provider ID | `keycloak` |
-| Type | `keycloak` |
-| Client ID | `paperclip` |
-| Client Secret | `paperclip-sso-secret` |
-| Issuer | `http://localhost:8080/realms/paperclip` |
-| Display Name | `Keycloak SSO` |
-| Required Roles → Claim Path | `resource_access.paperclip.roles` |
-| Required Roles → Roles | `human` |
-
-5. Click **Save SSO Settings**
-
-> **Important**: The issuer URL must use `localhost:8080` (not `keycloak:8080`),
-> because the browser needs to reach Keycloak directly. The server container uses
-> `extra_hosts: ["localhost:host-gateway"]` so that `localhost` inside the container
-> resolves to the Docker host, allowing it to reach the Keycloak port mapping.
->
-> The Keycloak container also sets `KC_HOSTNAME: http://localhost:8080` so that
-> Keycloak always issues tokens with `http://localhost:8080` as the `iss` claim,
-> regardless of whether a request arrived via the browser (`localhost:8080`) or
-> from the `server` container over the Docker network. Without it, Keycloak
-> infers the issuer from each request's `Host` header, so backchannel token
-> validation from `server` and browser-driven redirects can disagree on the
-> issuer and token validation fails.
-
-### Test the SSO flow
-
-1. Sign out of Paperclip
-2. The login page now shows a **Keycloak SSO** button
-3. Click it and authenticate in Keycloak with one of the pre-configured users:
-
-| Username   | Password   | Email                      | Client role `human` | Can sign in? |
-|------------|------------|----------------------------|---------------------|--------------|
-| `admin`    | `admin`    | `admin@paperclip.local`    | Yes                 | Yes          |
-| `operator` | `operator` | `operator@paperclip.local` | Yes                 | Yes          |
-| `viewer`   | `viewer`   | `viewer@paperclip.local`   | No                  | No (rejected by `requiredRoles`) |
-
-4. After authentication, users with the `human` client role are redirected back to Paperclip with an active session. The `viewer` user is rejected because the config requires `resource_access.paperclip.roles` to contain `human`.
-
-### Keycloak admin console
-
-Access Keycloak admin at `http://localhost:8080/admin` (credentials: `admin` / `admin`).
-
-The pre-imported `paperclip` realm contains:
-
-- OIDC client: `paperclip` (secret: `paperclip-sso-secret`)
-- Redirect URI: `http://localhost:3100/api/auth/oauth2/callback/keycloak`
-- Default scopes: `openid`, `email`, `profile`, `roles`
-- Client role: `human` (used for role-based access restriction)
-- Protocol mapper: `paperclip-client-roles-idtoken` (includes client roles in `id_token`)
-
-### Clean up
-
-```sh
-docker compose -f docker/docker-compose.sso.yml down -v
-```
-
-## Legacy: Environment Variable Configuration
-
-The `PAPERCLIP_SSO_PROVIDERS` environment variable and `auth.ssoProviders` config file
-option still work as a fallback for pre-configuring OAuth providers at startup. However,
-the recommended approach is to use the Instance Settings UI.
-
-When SSO is not enabled via Instance Settings, providers from the env var are registered
-in Better Auth (so OAuth callbacks work) but are **not shown** on the login page. Enable
-SSO in Instance Settings to make providers visible and functional.
-
-## Production Deployment
-
-### Secret management
-
-SSO credentials (`clientSecret`) are stored in the database. For production:
-
-- Use Paperclip's secrets provider (`PAPERCLIP_SECRETS_PROVIDER`) for encryption at rest when available
-- Ensure database backups are encrypted
-
-### Trusted origins
-
-Better Auth validates the `Origin` header on auth requests. In `authenticated` mode, Paperclip automatically derives trusted origins from:
-
-- `auth.publicBaseUrl` (when `auth.baseUrlMode` is `explicit`)
-- `server.allowedHostnames` entries
-- `BETTER_AUTH_TRUSTED_ORIGINS` env var (comma-separated)
-
-Ensure your production domain is covered by one of these.
-
-### HTTPS requirement
-
-Production SSO deployments should use HTTPS. When `PAPERCLIP_PUBLIC_URL` starts with `https://`, Better Auth enables secure cookies. When it starts with `http://`, secure cookies are disabled (appropriate only for local development).
-
-## Environment Variable Reference
-
-| Variable                       | Description                              |
-|--------------------------------|------------------------------------------|
-| `PAPERCLIP_PUBLIC_URL`         | Base URL for callback URL construction   |
-| `BETTER_AUTH_SECRET`           | Required for authenticated mode          |
-| `BETTER_AUTH_TRUSTED_ORIGINS`  | Additional trusted origins (comma-separated) |
-| `PAPERCLIP_SSO_PROVIDERS`      | Legacy: JSON array of SSO provider configs (use UI instead) |
-
-## Technical Reference
-
-### API endpoints
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/auth/sso-providers` | GET | Returns configured provider metadata (no secrets); empty when SSO disabled |
-| `/api/auth/sign-in/oauth2` | POST | Initiates SSO flow; body: `{ providerId, callbackURL }` |
-| `/api/auth/oauth2/callback/{providerId}` | GET | OAuth2 callback; exchanges code for tokens |
-| `/api/instance/settings/sso` | GET | Read SSO settings (instance admin) |
-| `/api/instance/settings/sso` | PATCH | Update SSO settings and rebuild auth (instance admin) |
-
-### Implementation files
-
-| Layer | File | Role |
-|---|---|---|
-| Shared | `packages/shared/src/config-schema.ts` | `SsoProviderConfig` type and Zod validation |
-| Server | `server/src/auth/better-auth.ts` | Better Auth instance, OAuth plugin wiring, dynamic rebuild via `BetterAuthManager` |
-| Server | `server/src/app.ts` | SSO providers endpoint, auth handler proxy |
-| Server | `server/src/routes/instance-settings.ts` | SSO settings CRUD, triggers auth rebuild on save |
-| Server | `server/src/services/instance-settings.ts` | DB read/write for SSO settings |
-| UI | `ui/src/api/auth.ts` | `getSsoProviders()`, `signInSso()` |
-| UI | `ui/src/pages/Auth.tsx` | SSO button rendering |
+The compose/realm/bootstrap recipe is a development fixture. It sets an explicit
+public auth origin and uses the standard Better Auth 1.7 callback. Do not run the
+bootstrap script against an existing/live instance.
+Synthetic signed-provider tests exercise issuer/audience/signature/JWKS/algorithm,
+nonce, PKCE, state/replay, admission, linking, token guards and local sessions.
+They do not prove live Keycloak reverse-proxy/TLS/realm configuration, browser
+cookies, upgrade of real accounts, backup restoration or execution isolation.
+Before rollout, qualify those against an isolated Keycloak realm with synthetic
+accounts. Agent execution and deployment remain separate, disabled workstreams.

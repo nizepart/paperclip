@@ -1,6 +1,6 @@
 import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
-import type { SsoProviderConfig } from "@paperclipai/shared";
+import type { InstanceSettings, InstanceSsoSettings } from "@paperclipai/shared";
 import {
   issueGraphLivenessAutoRecoveryRequestSchema,
   patchInstanceSettingsSchema,
@@ -8,7 +8,7 @@ import {
   patchInstanceGeneralSettingsSchema,
   patchInstanceSsoSettingsSchema,
 } from "@paperclipai/shared";
-import { forbidden } from "../errors.js";
+import { badRequest, forbidden } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { validate } from "../middleware/validate.js";
 import { heartbeatService, instanceSettingsService, logActivity } from "../services/index.js";
@@ -26,9 +26,21 @@ function assertCanManageInstanceSettings(req: Request) {
   throw forbidden("Instance admin access required");
 }
 
+function publicInstanceSettings(settings: InstanceSettings) {
+  return {
+    ...settings,
+    sso: settings.sso && { ...settings.sso, providers: settings.sso.providers.map(({ clientSecret, ...provider }) => ({
+      ...provider, clientSecretConfigured: Boolean(clientSecret),
+    })) },
+  };
+}
+
 export function instanceSettingsRoutes(
   db: Db,
-  opts?: { onSsoSettingsChanged?: (providers: SsoProviderConfig[]) => void },
+  opts?: {
+    validateSsoSettings?: (settings: InstanceSsoSettings) => void;
+    onSsoSettingsChanged?: (settings: InstanceSsoSettings) => void;
+  },
 ) {
   const router = Router();
   const svc = instanceSettingsService(db);
@@ -37,7 +49,7 @@ export function instanceSettingsRoutes(
 
   router.get("/instance/settings", async (req, res) => {
     assertBoardOrgAccess(req);
-    res.json(await svc.get());
+    res.json(publicInstanceSettings(await svc.get()));
   });
 
   router.patch(
@@ -74,7 +86,7 @@ export function instanceSettingsRoutes(
           }),
         ),
       );
-      res.json(updated);
+      res.json(publicInstanceSettings(updated));
     },
   );
 
@@ -232,10 +244,14 @@ export function instanceSettingsRoutes(
     validate(patchInstanceSsoSettingsSchema),
     async (req, res) => {
       assertCanManageInstanceSettings(req);
+      if (opts?.validateSsoSettings) {
+        const nextSettings = { ...await svc.getSso(), ...req.body };
+        try { opts.validateSsoSettings(nextSettings); }
+        catch { throw badRequest("SSO configuration requires authenticated mode and a valid explicit public origin."); }
+      }
       const updated = await svc.updateSso(req.body);
 
-      const activeProviders = updated.sso.enabled ? updated.sso.providers : [];
-      opts?.onSsoSettingsChanged?.(activeProviders);
+      opts?.onSsoSettingsChanged?.(updated.sso);
 
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();

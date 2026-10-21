@@ -10,7 +10,7 @@ import {
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
 } from "../types/instance.js";
 import { feedbackDataSharingPreferenceSchema } from "./feedback.js";
-import { ssoProviderConfigSchema } from "../config-schema.js";
+import { ssoProvidersSchema } from "../config-schema.js";
 
 function presetSchema<T extends readonly number[]>(presets: T, label: string) {
   return z.number().refine(
@@ -110,30 +110,18 @@ export const issueGraphLivenessAutoRecoveryRequestSchema = z.object({
     .optional(),
 }).strict();
 
-const ssoProvidersSchema = z
-  .array(ssoProviderConfigSchema)
-  .superRefine((providers, ctx) => {
-    // Better Auth registers providers by id — a duplicate silently
-    // overwrites the earlier registration, so reject it at the boundary.
-    const seen = new Set<string>();
-    providers.forEach((provider, index) => {
-      if (seen.has(provider.providerId)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `duplicate providerId "${provider.providerId}" — provider ids must be unique`,
-          path: [index, "providerId"],
-        });
-      }
-      seen.add(provider.providerId);
-    });
-  });
-
 export const instanceSsoSettingsSchema = z.object({
+  source: z.enum(["operator", "database"]).optional(),
   enabled: z.boolean().default(false),
   providers: ssoProvidersSchema.default([]),
 });
 
-export const patchInstanceSsoSettingsSchema = instanceSsoSettingsSchema.partial();
+// Zod 4 applies nested defaults through partial(); writes must preserve omitted values.
+export const patchInstanceSsoSettingsSchema = z.object({
+  source: z.enum(["operator", "database"]).optional(),
+  enabled: z.boolean().optional(),
+  providers: ssoProvidersSchema.optional(),
+});
 
 export type InstanceGeneralSettings = z.infer<typeof instanceGeneralSettingsSchema>;
 export type PatchInstanceGeneralSettings = z.infer<typeof patchInstanceGeneralSettingsSchema>;

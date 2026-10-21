@@ -262,6 +262,12 @@ export async function startServer(): Promise<StartedServer> {
     if (!rawUrl) return undefined;
     try {
       const parsed = new URL(rawUrl);
+      // Loopback and direct private HTTP URLs follow the backend port. A proxy's
+      // public origin (including its port) must stay stable for OIDC callbacks.
+      const isLoopback = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
+      const isDirectPrivateHttp = config.deploymentExposure === "private" &&
+        parsed.protocol === "http:" && Number(parsed.port) === config.port;
+      if (!isLoopback && !isDirectPrivateHttp) return rawUrl;
       // The URL API normalizes default ports like :80/:443 to "", so treat them as stable URLs.
       if (!parsed.port) return rawUrl;
       parsed.port = String(port);
@@ -562,7 +568,9 @@ export async function startServer(): Promise<StartedServer> {
   let resolveSessionFromHeaders:
     | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
     | undefined;
-  let onSsoSettingsChanged: ((providers: import("@paperclipai/shared").SsoProviderConfig[]) => void) | undefined;
+  let onSsoSettingsChanged: ((settings: import("@paperclipai/shared").InstanceSsoSettings) => void) | undefined;
+  let validateSsoSettings: ((settings: import("@paperclipai/shared").InstanceSsoSettings) => void) | undefined;
+  let getSsoProviders: (() => Promise<Array<{ providerId: string; displayName: string; type: string }>>) | undefined;
   if (config.deploymentMode === "local_trusted") {
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
@@ -615,26 +623,26 @@ export async function startServer(): Promise<StartedServer> {
     } = await import("./auth/better-auth.js");
     const ssoSvc = createSsoSvc(db as any);
     const dbSsoSettings = await ssoSvc.getSso();
-    const initialSsoProviders = dbSsoSettings.enabled && dbSsoSettings.providers.length > 0
-      ? dbSsoSettings.providers
-      : config.ssoProviders;
-    config.ssoProviders = initialSsoProviders;
+    const { resolveSsoProviders } = await import("./auth/sso-settings.js");
+    const initialSsoProviders = resolveSsoProviders(dbSsoSettings, config.ssoProviders);
 
-    if (config.ssoProviders.length > 0) {
+    if (initialSsoProviders.length > 0) {
       const publicBase = (config.authPublicBaseUrl ?? `http://localhost:${config.port}`).replace(/\/+$/, "");
       logger.info(
         {
-          providers: config.ssoProviders.map((p) => p.providerId),
-          callbackUrlPattern: `${publicBase}/api/auth/oauth2/callback/{providerId}`,
+          providers: initialSsoProviders.map((p) => p.providerId),
+          callbackUrlPattern: `${publicBase}/api/auth/callback/{providerId}`,
         },
         "SSO providers configured",
       );
     }
-    const authManager = createBetterAuthManager(db as any, config, effectiveTrustedOrigins);
+    const authManager = createBetterAuthManager(db as any, { ...config, ssoProviders: initialSsoProviders }, effectiveTrustedOrigins);
     betterAuthHandler = authManager.handler;
     resolveSession = (req) => authManager.resolveSession(req);
     resolveSessionFromHeaders = (headers) => authManager.resolveSessionFromHeaders(headers);
-    onSsoSettingsChanged = (providers) => authManager.rebuild(providers);
+    onSsoSettingsChanged = (settings) => authManager.rebuild(resolveSsoProviders(settings, config.ssoProviders));
+    validateSsoSettings = (settings) => authManager.validateSsoProviders(resolveSsoProviders(settings, config.ssoProviders));
+    getSsoProviders = () => authManager.getSsoProviders();
     await initializeBoardClaimChallenge(db as any, { deploymentMode: config.deploymentMode });
     authReady = true;
   }
@@ -790,11 +798,12 @@ export async function startServer(): Promise<StartedServer> {
     bindHost: config.host,
     authReady,
     companyDeletionEnabled: config.companyDeletionEnabled,
-    ssoProviders: config.ssoProviders,
+    getSsoProviders,
     pluginMigrationDb: pluginMigrationDb as any,
     betterAuthHandler,
     resolveSession,
     onSsoSettingsChanged,
+    validateSsoSettings,
     pluginWorkerManager,
     decisionServiceOptions,
     managedPluginAutoInstall,
